@@ -104,11 +104,26 @@ DEFAULT_CONFIG = {
     "EMBEDDING_DIM": 256,
 }
 
-# Model file path — use absolute path to ml_common weights
-MODEL_PATH = os.getenv(
-    "PERSON_SEARCH_MODEL_DIR",
-    "/Users/liaoruoxing/Documents/program/mot/person_search_oim.pth"
-)
+# Model file path — search relative to project root, fallback to env var
+def _find_model_path():
+    """Locate person_search_oim.pth: project root > env var > cwd."""
+    # 1) Project root (two levels up from yolox/reid/)
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    _candidate = os.path.join(_project_root, 'person_search_oim.pth')
+    if os.path.exists(_candidate):
+        return _candidate
+    # 2) Environment variable
+    _env = os.getenv("PERSON_SEARCH_MODEL_PATH")
+    if _env and os.path.exists(_env):
+        return _env
+    # 3) Current working directory
+    _cwd = os.path.join(os.getcwd(), 'person_search_oim.pth')
+    if os.path.exists(_cwd):
+        return _cwd
+    # Return default (will raise FileNotFoundError later if missing)
+    return _candidate
+
+MODEL_PATH = _find_model_path()
 
 # ============================================================================
 # ProtoNorm Implementation (from custom_modules.py - inference only)

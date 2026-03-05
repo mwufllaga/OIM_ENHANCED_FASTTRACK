@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import cv2, numpy as np
 from yolox.reid import extract_query_feature
 
-VIDEO = "/Users/liaoruoxing/Documents/program/mot/debug_0_320.mp4"
+VIDEO = "./demo/cam01 (2).mp4"
 
 cap = cv2.VideoCapture(VIDEO)
 

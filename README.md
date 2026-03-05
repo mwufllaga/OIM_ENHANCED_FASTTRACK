@@ -133,18 +133,40 @@ IoU = 0.18 ✗ （远低于阈值 0.7）
 
 ---
 
-## 使用方法
+## 环境安装
+
+**Python >= 3.8**，需要以下依赖：
 
 ```bash
-# 运行带 ReID 增强的跟踪
+# 1. 安装 PyTorch（根据你的 CUDA 版本选择，详见 https://pytorch.org）
+pip install torch torchvision
+
+# 2. 安装项目依赖
 cd FastTracker
-conda run --no-capture-output -n FastTracker \
-  python tools/demo_track.py video \
+pip install -r requirements.txt
+
+# 3. 编译安装项目
+python setup.py develop
+
+# 4. 安装额外依赖
+pip install cython cython_bbox pycocotools
+```
+
+> 权重文件 `person_search_oim.pth` 和 `pretrained/bytetrack_x_mot20.pth.tar` 已包含在仓库中，无需额外下载。
+
+## 运行
+
+```bash
+cd FastTracker
+python tools/demo_track.py video \
   -f exps/example/mot/yolox_x_mix_mot20_ch.py \
   -c pretrained/bytetrack_x_mot20.pth.tar \
-  --path "your_video.mp4" \
+  --path "demo/cam01 (2).mp4" \
   --fuse --save_result
 ```
+
+- `--path`：替换为你自己的视频路径
+- `--save_result`：保存跟踪结果视频和 txt 到 `YOLOX_outputs/` 目录
 
 ReID 模块在检测到 `person_search_oim.pth` 权重文件时自动启用，无需额外配置。Console 日志会输出所有 `[ReID-Recover]`、`[ContainPenalty]`、`[ReID] SWAP DETECTED` 事件供调试分析。
 
