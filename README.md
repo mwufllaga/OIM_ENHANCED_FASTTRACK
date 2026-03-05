@@ -1,366 +1,157 @@
-# FastTracker
+# FastTracker + OIM Person Search ReID 增强
 
-#### FastTracker is a real-Time and accurate visual tracking framework.
+## 概述
 
-<div align="center">
+本项目在 [FastTracker](https://github.com/Hamidreza-Hashempoor/FastTracker) 的基础上，引入了基于 **OIMNetPlus**（ECCV 2022）的行人重识别（ReID）模块，通过外观特征匹配显著增强了多目标跟踪（MOT）在复杂场景下的身份保持能力。
 
-<!--
-[**Hamidreza Hashempoor**](https://hamidreza-hashempoor.github.io/)
--->
+原版 FastTracker 完全依赖纯几何算法（Kalman Filter 预测 + IoU 匹配）进行数据关联——这在目标运动平稳、检测连续时表现出色，但面对检测丢失、目标重现、KF 漂移等常见问题时存在结构性不足。**ReID 模块的引入正是为了从根本上弥补这些短板。**
 
-<!-- **TMLCN 2025** -->
+---
 
-</div>
+## 原版 FastTracker 面临的核心问题
 
+### 问题 1：检测短暂丢失后，目标获得新 ID
 
+| 场景 | 原因 |
+|------|------|
+| 目标被遮挡 / 检测器漏检数帧后重新出现 | KF 预测框已漂移，IoU 远低于匹配阈值 |
+| **结果** | 同一个人被分配全新的 track ID，ID Switch +1 |
 
-<div align="center">
-  <img src="./figs/tracker_radar.jpg" alt="Image main" width="30%" style="margin: 1%;">
-</div>
+纯 IoU 匹配完全无法判断"这个新检测是不是之前丢失的那个人"——它只看空间位置重叠，不看"这个人长什么样"。
 
-FastTracker is a general-purpose multi-object tracking framework designed for complex traffic scenes. FastTracker supports diverse object types—especially vehicles—and maintains identity through heavy occlusion and complex motion. It combines an occlusion-aware re-identification module with road-structure-aware tracklet refinement, using semantic priors like lanes and crosswalks for better trajectory accuracy. _[Hamidreza Hashempoor](https://hamidreza-hashempoor.github.io/),  Yu Dong Hwang_.
+### 问题 2：KF 预测框膨胀导致匹配失败
 
-##  Updates
+| 场景 | 原因 |
+|------|------|
+| 目标连续数帧未匹配，KF 沿速度方向持续外推 | 预测框面积远大于真实检测框 |
+| **结果** | IoU = 交集 / 并集，分母被膨胀框撑大，IoU 显著偏低（如 0.18） |
 
-| Date | Update |
-|------|---------|
-| **2025-12-03** |  Class aware motion prediction source code (import `fasttracker_cls.py` and `kalman_filter_cls.py` instead of `fasttracker.py` and `kalman_filter.py`). |
-| **2025-10-31** |  Added C++ deployment version (FastTracker_CPP). |
-| **2025-10-21** |  Added ROI and Cone handling functions source codes. |
+即使新检测此刻就在 track 的预测范围内，由于面积比严重失衡，标准 IoU 计算认为这是"不同的目标"。
 
+### 问题 3：遮挡分离后 ID 互换
 
-## Resources
-| Huggingface Dataset | Paper |
-|:-----------------:|:-------:|
-|[![dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-blue)](https://huggingface.co/datasets/Hamidreza-Hashemp/FastTracker-Benchmark)|[![arXiv](https://img.shields.io/badge/arXiv-2508.14370-blue)](https://arxiv.org/abs/2508.14370)
+| 场景 | 原因 |
+|------|------|
+| 两个目标互相遮挡、KF 框互相重叠后分开 | 匈牙利匹配在重叠期间可能将检测分配给错误的 track |
+| **结果** | 两个 track 的 ID 在分离后交换，后续跟踪全错 |
 
+纯 IoU 匹配在两个框高度重叠时没有区分依据——它不知道哪个检测属于哪个人。
 
+---
 
+## 引入 OIM Person Search 后的解决方案
 
-## Benchmark
-FastTrack-Benchmark is a high-density multi-object tracking benchmark tailored for complex urban traffic scenes. It features 800K annotations across 12 diverse scenarios with 9 object classes, offering over 5× higher object density than existing benchmarks—making it ideal for evaluating trackers under extreme occlusion, interaction, and scene variety.
-The Benchmark is public and available in our [**Huggingface Dataset**](https://huggingface.co/datasets/Hamidreza-Hashemp/FastTracker-Benchmark)
+### 方案 1：批量 ReID 恢复（Step 4 增强）
 
-
-<div align="center">
-  <img src="./figs/fasttrack_benchmark.jpg" alt="Image main" width="50%" style="margin: 1%;">
-</div>
-
-## Framework
-
-Occlusion-aware tracking strategy framework that detects occluded tracklets based on center-proximity with nearby objects. Once detected, occluded tracklets are marked inactive, their motion is dampened to prevent drift, and their bounding boxes are slightly enlarged to aid re-identification. 
-
-<div align="center">
-<img src="./figs/fasttrack_occ_alg.jpg" alt="Occlusion Algorithm" style="width:70%;"/>
-</div>
-
-## Tracking performance
-### Results on MOT challenge test set
-| Dataset    | MOTA | IDF1 | HOTA | FP    | FN     | IDs |
-|------------|------|------|------|-------|--------|-----|
-| MOT16      | 79.1 | 81.0 | 66.0 | 8785  | 29028  | 290 |
-| MOT17      | 81.8 | 82.0 | 66.4 | 26850 | 75162  | 885 |
-| MOT20      | 77.9 | 81.0 | 65.7 | 24590 | 89243  | 684 |
-| FastTracker| 64.4 | 79.2 | 61.5 | 29730 | 68541  | 251 |
-
-## Installation on the host machine
-
-Steps: Setup the environment
-```shell
-cd <home>
-conda create --name FastTracker python=3.9
-conda activate FastTracker
-pip3 install -r requirements.txt  # Ignore the errors
-python setup.py develop
-pip3 install cython
-conda install -c conda-forge pycocotools
-pip3 install cython_bbox
-```
-
-
-
-## Data preparation
-
-Download [MOT16](https://motchallenge.net/), [MOT17](https://motchallenge.net/), [MOT20](https://motchallenge.net/), [FastTracker](https://huggingface.co/datasets/Hamidreza-Hashemp/FastTracker-Benchmark) and put them under `./datasets` in the following structure:
-```
-datasets
-   |——————FastTracker
-   |        └——————train
-   |        └——————test
-   |——————MOT16
-   |        └——————train
-   |        └——————test
-   |——————mot
-   |        └——————train
-   |        └——————test
-   └——————MOT20
-            └——————train
-            └——————test
+**切入点**：在新 track 即将被创建时介入。
 
 ```
-
-Then, you need to turn the datasets to COCO format and mix different training data:
-
-```shell
-cd <home>
-python tools\\convert_mot16_to_coco.py
-python tools\\convert_mot17_to_coco.py 
-python tools\\convert_mot20_to_coco.py
+新检测未匹配任何 active track
+          ↓
+空间过滤：在丢失/维持 track 附近（IoU > 0.3 或中心距 < 1.5x 框尺寸）
+          ↓
+ReID 比对：从 frame_buffer 中提取该 track 最后一次成功检测的图像，
+          与当前检测做 256 维 embedding 余弦相似度比较
+          ↓
+sim > 0.6 → 恢复原 ID，不创建新 track
+sim < 0.6 → 正常创建新 track，不干扰原有逻辑
 ```
-(For FastTracker benchmark use  [`convert_to_coco.py`](https://huggingface.co/datasets/Hamidreza-Hashemp/FastTracker-Benchmark/blob/main/convert_to_coco.py)
-to make annotations.
 
-## Pretrained Weights
+**核心设计**：
+- **批量冲突解决**：同一个丢失 track 被多个检测匹配时，取相似度最高的；每个检测只能恢复一个 track
+- **30 帧图像缓存**（`frame_buffer`）：保留最近 30 帧原始 RGB 图像，确保 ReID 特征提取有图可用
+- **400×400 裁剪提取**：以目标中心裁剪固定区域输入 ReID 模型，保证目标占合理比例
+- **不污染主流程**：只在 Step 4（新 track 创建前）介入，完全不修改 Step 2/3 的 IoU 匹配逻辑
 
-To use FastTracker's default models for MOT17 and MOT20 benchmarks, download the following pretrained weights from the [ByteTrack repository](https://github.com/ifzhang/ByteTrack):
+### 方案 2：ContainPenalty（Step 2 IoU 增强）
 
-- `bytetrack_x_mot17.pth.tar`  
-- `bytetrack_x_mot20.pth.tar`  
+**切入点**：在主匹配阶段修正 IoU 失真。
 
-Place both files into the `./pretrained/` directory.
+当一个 track 已经 `not_matched > 0`（KF 在外推），其膨胀预测框可能"包含"了真实检测但 IoU 很低。ContainPenalty 额外计算包含比（`交集 / 检测面积`），当检测大部分区域都落在 track 的预测框内时，用 `1 - 包含比` 作为替代代价，使得匈牙利算法有机会匹配成功。
 
-For **MOT16 benchmark**, you can use weights trained for MOT17 `bytetrack_x_mot17.pth.tar`. For the **FastTrack benchmark**, which includes multiple object classes beyond pedestrians, you need to retrain the YOLOX for multi-class detection. 
+```
+T12 的 KF 预测框 [2242, 700, 46×104]（膨胀）
+新检测          [2274, 705, 40×92] （真实大小）
 
-The FastTrack benchmark uses `frame, id, bb_left, bb_top, bb_width, bb_height, conf, class, 1.0` format which is similar to the standard MOT format (except that class is added and x,y,z coordinates are removed), where each `gt/gt.txt` file already provides frame-level detections with object class annotations. To train a detector:
+IoU = 0.18 ✗ （远低于阈值 0.7）
+包含比 = 0.35 → 替代代价 = 0.65 < 0.7 ✓ → 匹配成功
+```
 
-1. You **do not need to extract frames manually**—the frame-wise detections are already specified.
-2. Simply **ignore the track IDs** in `gt.txt`, as detector training requires only bounding boxes and class labels.
-3. Convert the annotations to COCO-style format using the provided class and bounding box info.
-4. Use the ByteTrack training scripts to retrain YOLOX with the new annotations.
+### 方案 3：ReID 分裂检测（重叠/分离 swap 纠正）
 
-This enables FastTracker to detect and track multiple object types effectively in complex traffic environments.
+**切入点**：在两个 track 从重叠状态分离时校验。
 
+```
+检测叠 → 记录重叠对
+         ↓
+分离（IoU < 0.1）→ 取两个 track 在重叠前采集的参考 embedding
+         ↓
+对比当前位置的外观与两个参考 → 投票判断 ID 是否正确
+         ↓
+检测到互换 → 交换两个 track 的状态
+```
 
-## Tracking
+每个 track 在 tracklet_len = 5/10/15 时采集 3 个参考 embedding，确保参考特征稳健（多时刻均值投票）。
 
-Run FastTracker:
+---
 
-To evaluate **FastTracker** on the **MOT17 benchmark** and **MOT20 benchmark**, simply run the following command:
+## 与纯算法方案的本质差异
+
+| 维度 | 纯算法（原版） | + OIM ReID（本版） |
+|------|:---:|:---:|
+| 匹配依据 | 仅空间位置（IoU） | 空间 + **外观特征** |
+| 丢失 15 帧后重现 | 新 ID（必然失败） | **sim=0.77 恢复原 ID** ✓ |
+| KF 膨胀框匹配 | IoU 失真 → 匹配失败 | ContainPenalty 修正 ✓ |
+| 遮挡后 ID 互换 | 无法检测 | ref_embedding 投票纠正 ✓ |
+| 计算开销 | 极低 | +ReID 推理（~5ms/crop） |
+| 误匹配风险 | 无（但也无法恢复） | sim 阈值 0.6 把关 |
+
+---
+
+## 关键技术指标
+
+- **ReID 模型**：OIMNetPlus（ResNet-50 backbone），256 维 L2 归一化 embedding
+- **模型权重**：`person_search_oim.pth`（约 140MB）
+- **推理设备**：自动检测 CUDA / MPS / CPU
+- **恢复条件**：
+  - 余弦相似度 > 0.6
+  - 丢失时间 ≤ 30 帧（`track_buffer`）
+  - 空间约束：中心距 < 1.5× 框尺寸
+- **冲突解决**：全局最优（每个 track 取最高 sim，每个检测只用一次）
+
+---
+
+## 文件修改清单
+
+| 文件 | 改动 | 作用 |
+|------|------|------|
+| `yolox/tracker/fasttracker.py` | +570 行 | ReID 恢复、ContainPenalty、分裂检测、遮挡处理 |
+| `tools/demo_track.py` | +58 行 | raw_img 传递、ReID 可视化、日志输出 |
+| `yolox/models/yolo_head.py` | +8 行 | MPS 设备兼容 |
+| `yolox/utils/model_utils.py` | +18 行 | MPS 性能分析兼容 |
+| `yolox/reid/person_search.py` | 新增 | OIMNetPlus ReID 模块 |
+
+---
+
+## 使用方法
 
 ```bash
-bash run_mot17.sh
-bash run_mot20.sh
-```
-For  **MOT16 benchmark** and **FatTracker benchmark**, you can use `bash run_mot17.sh`, but need to change the weight directory, experiment name and experiment file.
-
-### ⚙️ Understanding `run_mot17.sh` and `run_mot20.sh` Configuration:
-
-The `run_mot17.sh` script begins by defining a set of key variables that control the evaluation pipeline:
-
-```bash
-EXP_FILE="exps/example/xx"
-CKPT="pretrained/bytetrack_x_motxx.pth.tar"
-BATCH=1
-DEVICES=1
-EXPERIMENT_NAME="xx"
-OUTPUTS_ROOT="YOLOX_outputs"
-CONFIGS_DIR="./configs"
+# 运行带 ReID 增强的跟踪
+cd FastTracker
+conda run --no-capture-output -n FastTracker \
+  python tools/demo_track.py video \
+  -f exps/example/mot/yolox_x_mix_mot20_ch.py \
+  -c pretrained/bytetrack_x_mot20.pth.tar \
+  --path "your_video.mp4" \
+  --fuse --save_result
 ```
 
-Here is the defenition of each variable:
+ReID 模块在检测到 `person_search_oim.pth` 权重文件时自动启用，无需额外配置。Console 日志会输出所有 `[ReID-Recover]`、`[ContainPenalty]`、`[ReID] SWAP DETECTED` 事件供调试分析。
 
-* `EXP_FILE`:
-Path to the YOLOX experiment definition file. This file specifies the model architecture, dataset format, and preprocessing.
-Example: `exps/example/mot/yolox_x_mix_det.py`.
+---
 
-* `CKPT`:
-Path to the pretrained checkpoint file. For `MOT17` or `MOT20`, you must download the appropriate `.pth.tar` file from the ByteTrack repository
- and place it under the `./pretrained/` directory.
-Examples: `pretrained/bytetrack_x_mot17.pth.tar` or `pretrained/bytetrack_x_mot20.pth.tar`
+## 参考
 
-* `BATCH`:
-The batch size used during inference. Typically set to `1` for tracking tasks.
-
-* `DEVICES`:
-Number of GPUs to use. Set to `1` for single-GPU setups. Can be increased for parallel evaluation.
-
-* `EXPERIMENT_NAME`:
-A unique name identifying the current experiment.
-The outputs (logs, tracking results, etc.) will be saved under `YOLOX_outputs/<EXPERIMENT_NAME>/`.
-
-* `OUTPUTS_ROOT`:
-The root directory where experiment outputs are saved.
-
-* `CONFIGS_DIR`:
-Directory containing multiple `.json` configuration files. Each config file defines tracking hyperparameters such as thresholds, buffer sizes, and occlusion handling settings.
-The script automatically runs tracking once per config file inside this folder.
-
-### 📄 Details of Tracking Configuration Files (./configs/*.json)
-Each JSON file inside the `./configs` directory specifies a different set of hyperparameters for tracking evaluation.
-
-* `track_thresh`:
-Minimum detection score for initializing or updating a track. Lowering this allows weaker detections to be considered.
-
-* `track_buffer`:
-Maximum number of frames a tracklet is kept alive without receiving a matching detection.
-
-* `match_thresh`:
-IOU threshold used for associating detections to existing tracklets.
-
-* `min_box_area`:
-Minimum area of bounding boxes to be considered for tracking. Useful for filtering out tiny detections.
-
-* `reset_velocity_offset_occ`:
-Velocity smoothing offset applied when a tracklet is marked as occluded. Higher values help reduce drift.
-
-* `reset_pos_offset_occ`:
-Position smoothing offset for occluded objects. Controls how much the predicted position can shift.
-
-* `enlarge_bbox_occ`:
-Factor to enlarge bounding boxes of occluded objects. Helps improve re-identification during reappearance.
-
-* `dampen_motion_occ`:
-Dampening factor for the velocity vector of occluded objects. Reduces aggressive forward prediction.
-
-* `active_occ_to_lost_thresh`:
-Number of frames an occluded object can remain unmatched before being marked as lost.
-
-* `init_iou_suppress`:
-IOU suppression threshold used to avoid initializing duplicate tracks from overlapping detections.
-
-* `ROIs`:
-Defines all Regions of Interest (ROIs) in the scene, each described by a polygon of corner points in pixel coordinates.
-
-* `roi_repair_max_gap`:
-Maximum number of frames a track can disappear within an ROI before it’s considered broken and needs re-initialization.
-
-* `dir_window_N`:
-Sliding window length (in frames) for estimating object motion direction stability.
-
-* `dir_margin_deg`:
-Angular tolerance (in degrees) allowed when comparing direction estimates — smaller values enforce stricter direction consistency.
-
-
-### 📦 Output Structure 
-After running each .sh file (e.g., `run_mot17.sh` or `run_mot20.sh`), the full set of tracking results will be saved in:
-```shell
-./YOLOX_outputs/<EXPERIMENT_NAME>/runX/track_results/
-```
-
-* Each `runX` folder (e.g., `run000`, `run001`, ...) corresponds to a different config file in the `./configs` directory.
-
-* Inside each `track_results/` folder, you will find `.txt` result files for each video sequence.
-
-* These result files are already formatted in the standard MOT Challenge format and can be directly submitted to the MOT Challenge evaluation server.
-
-To reproduce the best performance reported in our paper and in MOT Challenge server, you need to tune the hyperparameters for each video sequence individually 
-in  [lines 150-170 mot_evaluator.py](https://github.com/Hamidreza-Hashempoor/FastTracker/blob/main/yolox/evaluators/mot_evaluator.py).
-This is done by editing the corresponding JSON config file in `./configs/` with sequence-specific values (e.g., `track_thresh`, `match_thresh`, etc.).
-
-## Obtain MOTA /IDS/ HOTA and other evaluation
-To evaluate tracking performance using standard metrics such as MOTA, IDF1, HOTA, FP, FN, and ID switches, we use the [TrackEval repository](https://github.com/JonathonLuiten/TrackEval).
-
-### 🧪 Run Evaluation with run_eval.sh
-After running your tracking experiments, simply execute:
-```bash
-run_eval.sh
-```
-This script will evaluate the results produced in each:
-```bash
-./YOLOX_outputs/<EXPERIMENT_NAME>/runX/track_results/
-```
-
-* Each runX corresponds to a different tracking configuration file used during tracking.
-
-* The results from TrackEval will be saved under the same `track_results/` directory.
-
-* These include `.txt` summary files containing the full set of metrics
-
-### ⚙️ Understanding run_eval.sh Configuration
-The `run_eval.sh` script is used to evaluate the tracking results using TrackEval.
-It defines several key variables that control what experiment to evaluate, where the predictions are located, and where the ground-truth lives. In this bash file, as example, we have:
-```shell
-TRACKEVAL_ROOT="${SCRIPT_DIR}/TrackEval"
-BENCHMARK="MOT15"
-USE_PARALLEL="False"
-
-TRACK_SCRIPT="tools/track.py"
-HOTA_PREP="${TRACKEVAL_ROOT}/hotaPreparation.py"
-RUN_MOT="${TRACKEVAL_ROOT}/scripts/run_mot_challenge.py"
-path_folder="${TRACKEVAL_ROOT}/data/"
-EXP_DIR="${OUTPUTS_ROOT}/${EXPERIMENT_NAME}"
-
-GT_ROOT="${SCRIPT_DIR}/gt/MOT17"
-RESULTS_DIR="${SCRIPT_DIR}/YOLOX_outputs/yolox_x_mix_det/run002/track_results"
-```
-* `TRACKEVAL_ROOT`: Path to the local clone of the TrackEval
- repository.
-
-* `BENCHMARK`: The benchmark to evaluate against. Must match the format expected by TrackEval.
-
-* `USE_PARALLEL`: Set to "`True`" to enable parallel evaluation over multiple sequences.
-
-* `TRACK_SCRIPT`: (Optional) Path to your internal tracking script, if reused during eval.
-
-* `HOTA_PREP`: Path to the script that prepares outputs for HOTA evaluation.
-
-* `RUN_MOT`: Path to TrackEval’s main evaluation script (`run_mot_challenge.py`).
-
-* `path_folder`: Internal path for TrackEval data structures.
-
-* `GT_ROOT`: Path to the directory containing ground truth annotations in `MOT` format. Update this path to point to the correct benchmark dataset.
-
-* `RESULTS_DIR`: Directory containing tracking result `.txt` files (in `MOT` format).
-
-## Post-processing with Gaussian Smoothing Interpolation (GSI)
-After running your tracking experiments, you can optionally apply Gaussian Smoothing Interpolation to refine the results. We provide a tool for this:
-
-```bash
-tools/GSI.py
-```
-To run GSI on your saved tracking results:
-```bash
-python tools/GSI.py \
-    --loadpath "./YOLOX_outputs/experiment_name/runx/track_results" \
-    --savepath "./YOLOX_outputs/experiment_name/runx/track_results_gsi"
-```
-
-* `--loadpath`: Path to the directory containing the original tracking result `.txt` files. These are generated after running `run_mot17.sh` or `run_mot20.sh`.
-
-* `--savepath`: Output directory where the smoothed results will be saved.
-
-* The smoothed results will maintain `MOT` format, and can be used directly for evaluation.
-
-This post-processing step is optional and meant for offline use only — it is not applicable in real-time systems.
-
-## Deployment
-
-* Deployment for C++ application is added. Refer to `deployc/c++`.
-## Demo
-
-
-<div align="center">
-  <img src="./figs/fasttrack_occ_enlarge_bb.jpg" alt="Image main" width="50%" style="margin: 1%;">
-</div>
-
-
-Simply run:
-
-```bash
-python tools/demo_track.py video -f exps/example/mot/yolox_x_mix_det.py -c pretrained/bytetrack_x_mot17.pth.tar --fp16 --fuse --save_result
-```
-
-## Citation
-If you use our code or Benchmark, please cite our work.
-
-
-```
-@misc{hashempoor2025fasttrackerrealtimeaccuratevisual,
-      title={FastTracker: Real-Time and Accurate Visual Tracking}, 
-      author={Hamidreza Hashempoor and Yu Dong Hwang},
-      year={2025},
-      eprint={2508.14370},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2508.14370}, 
-}
-```
-
-## Acknowledgement
-Our work is built upon [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX), [ByteTrack](https://github.com/FoundationVision/ByteTrack/tree/main), [TransTrack](https://github.com/PeizeSun/TransTrack) and [TrackEval](https://github.com/JonathonLuiten/TrackEval). Highly appreciated!
-
-
-
-
-
-
+- [FastTracker](https://arxiv.org/abs/2508.14370) - Hamidreza Hashempoor, Yu Dong Hwang
+- [OIMNetPlus](https://github.com/cvlab-yonsei/OIMNetPlus) - ECCV 2022
+- [ByteTrack](https://github.com/ifzhang/ByteTrack) - 基础关联框架
