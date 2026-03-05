@@ -1,1 +1,19 @@
+# OS
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.so
+
+# Outputs & Logs
+YOLOX_outputs/
+*.log
+logs/
+
+# Debug
+reid_debug_bbox/
+
+# Videos (only keep demo/)
+*.mp4
+!demo/*.mp4

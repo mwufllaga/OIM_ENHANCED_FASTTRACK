@@ -1,0 +1,1 @@
+from .person_search import extract_query_feature

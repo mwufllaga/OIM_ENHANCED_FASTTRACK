@@ -7,10 +7,12 @@ import torch
 import torch.nn.functional as F
 import json
 import math
+import cv2 as _cv2
 
 from .kalman_filter import KalmanFilter
 from yolox.tracker import matching
 from .basetrack import BaseTrack, TrackState
+from yolox.reid import extract_query_feature as _reid_extract
 
 
 
@@ -33,6 +35,10 @@ class STrack(BaseTrack):
         self.last_occluded_frame = -1
         self.was_recently_occluded = False
         self.mean_history = []
+        self.det_bbox_history = []  # (frame_id, tlbr) for ReID
+        self.ref_embeddings = []  # list of ReID embeddings captured at frames 5, 10, 15
+        self.ref_embedding_crops = []  # list of (frame_id, crop_img) for debug visualization
+        self.ref_embedding_target_frames = {5, 10, 15}  # tracklet_len values to capture
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -63,6 +69,9 @@ class STrack(BaseTrack):
         if len(self.mean_history) > 100:  # limit history length
             self.mean_history.pop(0)
 
+        self.det_bbox_history.append((frame_id, STrack.tlwh_to_tlbr(self._tlwh).copy()))
+        if len(self.det_bbox_history) > 150:
+            self.det_bbox_history.pop(0)
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -79,6 +88,10 @@ class STrack(BaseTrack):
         self.mean_history.append(self.mean.copy())
         if len(self.mean_history) > 100:  # limit history length
             self.mean_history.pop(0)
+
+        self.det_bbox_history.append((frame_id, STrack.tlwh_to_tlbr(new_track.tlwh).copy()))
+        if len(self.det_bbox_history) > 150:
+            self.det_bbox_history.pop(0)
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -107,10 +120,18 @@ class STrack(BaseTrack):
         if len(self.mean_history) > 100:  # limit history length
             self.mean_history.pop(0)
 
+        self.det_bbox_history.append((frame_id, STrack.tlwh_to_tlbr(new_track.tlwh).copy()))
+        if len(self.det_bbox_history) > 150:
+            self.det_bbox_history.pop(0)
+
         self.state = TrackState.Tracked
         self.is_activated = True
 
         self.score = new_track.score
+        
+        # Mark for embedding capture (actual extraction happens in Fasttracker.update)
+        if hasattr(self, 'ref_embedding_target_frames') and self.tracklet_len in self.ref_embedding_target_frames:
+            self._pending_embedding_capture = True
 
     @property
     # @jit(nopython=True)
@@ -234,13 +255,36 @@ class Fasttracker(object):
 
         self.kalman_filter = KalmanFilter()
 
+        # ReID split handling (person_search is a hard dependency)
+        self.reid_enabled = config.get("reid_enabled", True)
+        self.reid_sim_thresh = config.get("reid_sim_thresh", 0.4)
+        self.reid_split_iou_thresh = config.get("reid_split_iou_thresh", 0.3)  # IoU > this = overlapping
+        self.reid_separation_iou_thresh = config.get("reid_separation_iou_thresh", 0.1)  # IoU < this = separated, trigger ReID
+        self.frame_buffer = deque(maxlen=30)   # (frame_id, raw_img_rgb)
+        self.frame_sample_interval = 5
+        self.reid_vis_boxes = []  # Visual feedback: list of (tlbr, track_id, label_str) for current frame
+        # overlapped_pairs: set of (tid_a, tid_b) where tid_a < tid_b, tracks that have overlapped
+        self.overlapped_pairs = set()
+        # Debug: save ReID crops
+        self.reid_debug_dir = config.get("reid_debug_dir", None)
+        if self.reid_debug_dir:
+            os.makedirs(self.reid_debug_dir, exist_ok=True)
+            print(f"[ReID] Debug crops will be saved to: {self.reid_debug_dir}")
+        if self.reid_enabled:
+            print("[ReID] Split detection ENABLED")
+
         # Print config in terminal
         print("=== FastTracker Config ===")
         print(json.dumps(config, indent=2))
         print("=============================")
 
-    def update(self, output_results, img_info, img_size):
+    def update(self, output_results, img_info, img_size, raw_img=None):
         self.frame_id += 1
+
+        # Store every frame for ReID (buffer maxlen=30 covers the ~18-frame maintaining window)
+        if raw_img is not None and self.reid_enabled:
+            self.frame_buffer.append((self.frame_id, _cv2.cvtColor(raw_img, _cv2.COLOR_BGR2RGB)))
+
         activated_starcks = []
         refind_stracks = []
         lost_stracks = []
@@ -290,7 +334,38 @@ class Fasttracker(object):
         dists = matching.iou_distance(strack_pool, detections)
         if not self.args.mot20:
             dists = matching.fuse_score(dists, detections)
+
+        # ContainPenalty: when a track with not_matched>0 has an inflated KF box
+        # that partially contains a detection, IoU can be misleadingly low.
+        # Use containment ratio as a proxy cost to allow the match.
+        if len(strack_pool) > 0 and len(detections) > 0:
+            for i in range(len(strack_pool)):
+                if strack_pool[i].not_matched == 0:
+                    continue
+                t_box = strack_pool[i].tlbr
+                for j in range(len(detections)):
+                    d_box = STrack.tlwh_to_tlbr(detections[j].tlwh)
+                    d_area = (d_box[2] - d_box[0]) * (d_box[3] - d_box[1])
+                    ix1 = max(t_box[0], d_box[0])
+                    iy1 = max(t_box[1], d_box[1])
+                    ix2 = min(t_box[2], d_box[2])
+                    iy2 = min(t_box[3], d_box[3])
+                    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                    contain_ratio = inter / (d_area + 1e-9)
+                    if contain_ratio > 0.3:
+                        new_dist = 1.0 - contain_ratio
+                        if new_dist < dists[i][j]:
+                            print(f"[ContainPenalty] Frame {self.frame_id}: "
+                                  f"T{strack_pool[i].track_id} "
+                                  f"(not_matched={strack_pool[i].not_matched}) "
+                                  f"contains det (ratio={contain_ratio:.2f}), "
+                                  f"dist {dists[i][j]:.3f} -> {new_dist:.3f}")
+                            dists[i][j] = new_dist
+
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.match_thresh)
+
+        # ReID visual feedback reset
+        self.reid_vis_boxes = []
 
         for itracked, idet in matches:
             track = strack_pool[itracked]
@@ -421,6 +496,12 @@ class Fasttracker(object):
             print("Warn, init not found")
             init_iou_thr = 0.8
 
+        # --- ReID recovery: collect all (det, candidate_track, sim) first ---
+        # Then for each candidate track, pick the detection with highest sim.
+        # This prevents the same track being recovered by multiple detections.
+        reid_proposals = []  # list of (det_index, det_STrack, candidate_track, sim)
+        non_overlap_dets = []  # dets that pass IoU suppress but need ReID or activate
+
         for inew in u_detection:
             track = detections[inew]
             if track.score < self.det_thresh:
@@ -435,8 +516,47 @@ class Fasttracker(object):
                 if max_iou >= init_iou_thr:
                     break
 
-            # Only initialize if it does NOT heavily overlap an active track
+            # Only consider if it does NOT heavily overlap an active track
             if max_iou < init_iou_thr:
+                non_overlap_dets.append(track)
+
+        # Phase 1: Collect ReID match proposals for all non-overlap dets
+        if self.reid_enabled and raw_img is not None and non_overlap_dets:
+            all_proposals = self._batch_recover_maintaining_tracks(
+                non_overlap_dets, raw_img, r_tracked_stracks, lost_stracks
+            )
+            # all_proposals: list of (det_STrack, candidate_track, sim)
+            # For each candidate track, keep only the det with highest sim
+            best_per_track = {}  # track_id -> (det_STrack, candidate_track, sim)
+            for det_st, cand_t, sim in all_proposals:
+                tid = cand_t.track_id
+                if tid not in best_per_track or sim > best_per_track[tid][2]:
+                    best_per_track[tid] = (det_st, cand_t, sim)
+            # Also ensure each det is used at most once (pick highest sim)
+            used_dets = set()
+            for tid, (det_st, cand_t, sim) in sorted(best_per_track.items(), key=lambda x: -x[1][2]):
+                det_id_key = id(det_st)
+                if det_id_key in used_dets:
+                    continue
+                used_dets.add(det_id_key)
+                reid_proposals.append((det_st, cand_t, sim))
+
+        # Phase 2: Apply recoveries and activate remaining dets
+        recovered_det_ids = {id(det_st) for det_st, _, _ in reid_proposals}
+        for det_st, cand_t, sim in reid_proposals:
+            det_tlbr = STrack.tlwh_to_tlbr(det_st.tlwh)
+            self.reid_vis_boxes.append((
+                det_tlbr.copy(), cand_t.track_id,
+                f"Recover T{cand_t.track_id} sim={sim:.2f}"
+            ))
+            cand_t.re_activate(det_st, self.frame_id, new_id=False)
+            cand_t.not_matched = 0
+            cand_t.is_occluded = False
+            cand_t.occluded_len = 0
+            refind_stracks.append(cand_t)
+
+        for track in non_overlap_dets:
+            if id(track) not in recovered_det_ids:
                 track.activate(self.kalman_filter, self.frame_id)
                 activated_starcks.append(track)
 
@@ -464,7 +584,453 @@ class Fasttracker(object):
         # get scores of lost tracks
         output_stracks = [track for track in self.tracked_stracks if track.is_activated]
 
+        # ReID overlap tracking, separation check, then ref embedding capture
+        if self.reid_enabled and raw_img is not None:
+            self._record_overlaps(output_stracks)
+            self._check_separations(raw_img, output_stracks)
+            self._capture_ref_embeddings(raw_img, output_stracks)
+
         return output_stracks
+
+    def _find_containing_boxes(self, detections, contain_thresh=0.70, area_ratio_thresh=1.3):
+        """Find detection indices that are 'containing boxes' (oversized).
+
+        A detection is flagged if:
+        1. It contains > contain_thresh of a smaller detection's area
+        2. Its area is > area_ratio_thresh times the smaller detection's area
+
+        Returns a set of indices into detections that should receive a
+        distance penalty (but are NOT removed).
+        """
+        n = len(detections)
+        if n < 2:
+            return set()
+
+        tlbrs = [STrack.tlwh_to_tlbr(d.tlwh) for d in detections]
+        areas = [d.tlwh[2] * d.tlwh[3] for d in detections]
+
+        flagged = set()
+        for i in range(n):
+            for j in range(n):
+                if j == i:
+                    continue
+                # Only check if i is the LARGER box
+                if areas[i] <= areas[j]:
+                    continue
+
+                # Compute intersection
+                ix1 = max(tlbrs[i][0], tlbrs[j][0])
+                iy1 = max(tlbrs[i][1], tlbrs[j][1])
+                ix2 = min(tlbrs[i][2], tlbrs[j][2])
+                iy2 = min(tlbrs[i][3], tlbrs[j][3])
+                iw = max(0.0, ix2 - ix1)
+                ih = max(0.0, iy2 - iy1)
+                inter = iw * ih
+
+                if inter == 0:
+                    continue
+
+                contain_ratio = inter / (areas[j] + 1e-9)
+                area_ratio = areas[i] / (areas[j] + 1e-9)
+
+                if contain_ratio > contain_thresh and area_ratio > area_ratio_thresh:
+                    flagged.add(i)
+                    print(f"[ContainPenalty] Frame {self.frame_id}: det[{i}] "
+                          f"(area={areas[i]:.0f}) contains det[{j}] (area={areas[j]:.0f}), "
+                          f"contain={contain_ratio:.2f}, ratio={area_ratio:.2f}")
+                    break  # already flagged i
+
+        return flagged
+
+    # ================================================================
+    # Maintaining-track recovery via ReID
+    # ================================================================
+
+    def _batch_recover_maintaining_tracks(self, new_dets, raw_img, unmatched_tracked, just_lost,
+                                           iou_thresh=0.3, sim_thresh=0.6):
+        """Batch version: for all new detections, find ReID recovery proposals.
+
+        Returns list of (det_STrack, candidate_track, sim) where sim > sim_thresh.
+        Caller is responsible for resolving conflicts (multiple dets -> same track).
+        """
+        # Collect maintaining candidates (shared across all dets)
+        candidates = []
+        for t in unmatched_tracked:
+            if t.not_matched > 0 and t.state == TrackState.Tracked:
+                candidates.append(t)
+        for t in just_lost:
+            candidates.append(t)
+        for t in self.lost_stracks:
+            if (self.frame_id - t.end_frame) <= self.max_time_lost:
+                if t not in just_lost:
+                    candidates.append(t)
+
+        if not candidates:
+            return []
+
+        # Pre-compute candidate embeddings (extract once, reuse for all dets)
+        stored_frames = {fid: img for fid, img in self.frame_buffer}
+        cand_embeddings = {}  # track_id -> embedding
+        for t in candidates:
+            if t.track_id not in cand_embeddings:
+                emb = self._extract_last_det_embedding(t, stored_frames)
+                if emb is not None:
+                    cand_embeddings[t.track_id] = (t, emb)
+
+        if not cand_embeddings:
+            return []
+
+        rgb_img_cur = _cv2.cvtColor(raw_img, _cv2.COLOR_BGR2RGB)
+        proposals = []
+
+        for det in new_dets:
+            det_tlbr = STrack.tlwh_to_tlbr(det.tlwh)
+            det_cx = (det_tlbr[0] + det_tlbr[2]) / 2
+            det_cy = (det_tlbr[1] + det_tlbr[3]) / 2
+            det_w = det_tlbr[2] - det_tlbr[0]
+            det_h = det_tlbr[3] - det_tlbr[1]
+            dist_thresh = max(det_w, det_h) * 1.5
+
+            # Find spatially nearby candidates
+            nearby = []
+            for tid, (t, t_emb) in cand_embeddings.items():
+                t_tlbr = t.tlbr
+                iou_val = _iou(det_tlbr, t_tlbr)
+
+                ix1 = max(det_tlbr[0], t_tlbr[0])
+                iy1 = max(det_tlbr[1], t_tlbr[1])
+                ix2 = min(det_tlbr[2], t_tlbr[2])
+                iy2 = min(det_tlbr[3], t_tlbr[3])
+                iw = max(0.0, ix2 - ix1)
+                ih = max(0.0, iy2 - iy1)
+                inter = iw * ih
+                det_area = (det_tlbr[2] - det_tlbr[0]) * (det_tlbr[3] - det_tlbr[1])
+                contain_ratio = inter / (det_area + 1e-9) if det_area > 0 else 0.0
+
+                t_cx = (t_tlbr[0] + t_tlbr[2]) / 2
+                t_cy = (t_tlbr[1] + t_tlbr[3]) / 2
+                center_dist = ((det_cx - t_cx) ** 2 + (det_cy - t_cy) ** 2) ** 0.5
+
+                if iou_val > iou_thresh or contain_ratio > 0.3 or center_dist < dist_thresh:
+                    nearby.append((t, t_emb))
+
+            if not nearby:
+                continue
+
+            new_emb = self._extract_embedding(rgb_img_cur, det_tlbr)
+            if new_emb is None:
+                continue
+
+            for t, t_emb in nearby:
+                sim = float(np.dot(new_emb, t_emb))
+                if sim > sim_thresh:
+                    print(f"[ReID-Recover] Frame {self.frame_id}: det matched "
+                          f"track {t.track_id} (sim={sim:.3f}, "
+                          f"not_matched={t.not_matched}, "
+                          f"lost_frames={self.frame_id - t.end_frame})")
+                    proposals.append((det, t, sim))
+
+        return proposals
+
+    def _extract_last_det_embedding(self, track, stored_frames):
+        """Extract embedding from a track's last successful detection.
+        
+        Searches det_bbox_history in reverse (newest first) to find a frame
+        that exists in stored_frames (frame_buffer). Extracts embedding using
+        that frame image and the detection bbox at that time.
+        
+        Returns 256-dim embedding or None.
+        """
+        if not hasattr(track, 'det_bbox_history') or not track.det_bbox_history:
+            return None
+        # Reverse: prefer the most recent detection
+        for fid, tlbr in reversed(track.det_bbox_history):
+            if fid in stored_frames:
+                rgb_img = stored_frames[fid]
+                emb = self._extract_embedding(rgb_img, tlbr)
+                if emb is not None:
+                    return emb
+        return None
+
+    # ================================================================
+    # ReID-based split detection helpers
+    # ================================================================
+
+    REID_CROP_SIZE = 400  # crop a 400x400 region centered on bbox before ReID
+
+    def _extract_embedding(self, rgb_img, tlbr):
+        """Extract 256-dim L2-normalized ReID embedding from an RGB image.
+        
+        Crops a REID_CROP_SIZE x REID_CROP_SIZE region centered on the bbox
+        before passing to person_search, so the bbox occupies a reasonable
+        fraction of the input and background doesn't dominate the feature.
+        """
+        h, w = rgb_img.shape[:2]
+        x1, y1, x2, y2 = float(tlbr[0]), float(tlbr[1]), float(tlbr[2]), float(tlbr[3])
+        bw, bh = x2 - x1, y2 - y1
+        if bw < 1 or bh < 1:
+            return None
+
+        # Center of bbox
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        half = self.REID_CROP_SIZE / 2
+
+        # Crop bounds (clamp to image)
+        crop_x1 = int(max(0, cx - half))
+        crop_y1 = int(max(0, cy - half))
+        crop_x2 = int(min(w, cx + half))
+        crop_y2 = int(min(h, cy + half))
+
+        crop = rgb_img[crop_y1:crop_y2, crop_x1:crop_x2]
+        ch, cw = crop.shape[:2]
+        if ch < 10 or cw < 10:
+            return None
+
+        # Translate bbox to crop coordinates and normalize
+        bbox_norm = {
+            "x1": max(0.0, (x1 - crop_x1) / cw),
+            "y1": max(0.0, (y1 - crop_y1) / ch),
+            "x2": min(1.0, (x2 - crop_x1) / cw),
+            "y2": min(1.0, (y2 - crop_y1) / ch),
+        }
+        if bbox_norm["x2"] - bbox_norm["x1"] < 0.01 or bbox_norm["y2"] - bbox_norm["y1"] < 0.01:
+            return None
+        try:
+            feat = _reid_extract(crop, bbox_norm)
+            if feat is not None:
+                return np.array(feat, dtype=np.float32)
+        except Exception as e:
+            print(f"[ReID] Embedding extraction failed: {e}")
+        return None
+
+    def _crop_image(self, img, tlbr):
+        """Crop a region from image given tlbr bbox. Returns BGR crop or None."""
+        h, w = img.shape[:2]
+        x1 = max(0, int(tlbr[0]))
+        y1 = max(0, int(tlbr[1]))
+        x2 = min(w, int(tlbr[2]))
+        y2 = min(h, int(tlbr[3]))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return img[y1:y2, x1:x2].copy()
+
+    def _find_track_embedding_data(self, track):
+        """Find a stored frame + bbox for this track's historical appearance.
+        Prefers the OLDEST available stored frame (most reliable identity,
+        least likely contaminated by an ID switch).
+        Returns (rgb_img, tlbr) or (None, None)."""
+        if not hasattr(track, 'det_bbox_history') or not track.det_bbox_history:
+            return None, None
+        stored = {fid: img for fid, img in self.frame_buffer}
+        if not stored:
+            return None, None
+        # Iterate from OLDEST to newest → prefer oldest frame (most reliable identity)
+        for fid, tlbr in track.det_bbox_history:
+            if fid in stored:
+                return stored[fid], tlbr
+        return None, None
+
+    def _record_overlaps(self, output_stracks):
+        """Record track pairs that have IoU > threshold (overlapping).
+        
+        These pairs need to be checked when they separate.
+        """
+        if len(output_stracks) < 2:
+            return
+        
+        # Build list of (track_id, tlbr) — include all tracks with tracklet_len >= 2
+        track_boxes = []
+        for t in output_stracks:
+            if t.tracklet_len < 2:
+                continue  # Skip very new tracks (just initialized)
+            track_boxes.append((t.track_id, t.tlbr, t))
+        
+        # Check all pairs
+        for i in range(len(track_boxes)):
+            for j in range(i + 1, len(track_boxes)):
+                tid_a, tlbr_a, _ = track_boxes[i]
+                tid_b, tlbr_b, _ = track_boxes[j]
+                iou = _iou(tlbr_a, tlbr_b)
+                
+                if iou > self.reid_split_iou_thresh:
+                    # Record this pair (use sorted tuple for consistency)
+                    pair = (min(tid_a, tid_b), max(tid_a, tid_b))
+                    if pair not in self.overlapped_pairs:
+                        self.overlapped_pairs.add(pair)
+                        print(f"[ReID] Frame {self.frame_id}: T{tid_a} and T{tid_b} overlapping (IoU={iou:.2f})")
+
+    def _check_separations(self, raw_img, output_stracks):
+        """Check if any overlapped pairs have separated.
+        
+        When a pair separates (IoU <= threshold), use ReID to verify IDs.
+        Unified voting logic: each ref set votes independently.
+        - 0 ref sets = no vote, no swap
+        - 1 ref set = follow that vote
+        - 2 ref sets = if agree, follow; if conflict, follow larger margin
+        """
+        if not self.overlapped_pairs:
+            return
+        
+        raw_rgb = _cv2.cvtColor(raw_img, _cv2.COLOR_BGR2RGB)
+        
+        # Build track lookup
+        track_by_id = {t.track_id: t for t in output_stracks}
+        
+        resolved_pairs = []
+        
+        for pair in list(self.overlapped_pairs):
+            tid_a, tid_b = pair
+            
+            # Check if both tracks still exist
+            if tid_a not in track_by_id or tid_b not in track_by_id:
+                resolved_pairs.append(pair)
+                continue
+            
+            track_a = track_by_id[tid_a]
+            track_b = track_by_id[tid_b]
+            
+            # Calculate current IoU
+            iou = _iou(track_a.tlbr, track_b.tlbr)
+            
+            if iou >= self.reid_separation_iou_thresh:
+                # Not fully separated yet, keep waiting
+                continue
+            
+            # Separated!
+            print(f"[ReID] Frame {self.frame_id}: T{tid_a} and T{tid_b} separated (IoU={iou:.2f})")
+            
+            # Extract current embeddings for both positions
+            emb_a = self._extract_embedding(raw_rgb, track_a.tlbr)
+            emb_b = self._extract_embedding(raw_rgb, track_b.tlbr)
+            
+            # Save debug crops
+            if self.reid_debug_dir:
+                crop_a = self._crop_image(raw_img, track_a.tlbr)
+                crop_b = self._crop_image(raw_img, track_b.tlbr)
+                if crop_a is not None:
+                    _cv2.imwrite(os.path.join(self.reid_debug_dir, f"cmp_f{self.frame_id}_T{tid_a}_current.jpg"), crop_a)
+                if crop_b is not None:
+                    _cv2.imwrite(os.path.join(self.reid_debug_dir, f"cmp_f{self.frame_id}_T{tid_b}_current.jpg"), crop_b)
+                if hasattr(track_a, 'ref_embedding_crops'):
+                    for i, (fid, crop) in enumerate(track_a.ref_embedding_crops):
+                        _cv2.imwrite(os.path.join(self.reid_debug_dir, f"cmp_f{self.frame_id}_T{tid_a}_ref{i+1}_from_f{fid}.jpg"), crop)
+                if hasattr(track_b, 'ref_embedding_crops'):
+                    for i, (fid, crop) in enumerate(track_b.ref_embedding_crops):
+                        _cv2.imwrite(os.path.join(self.reid_debug_dir, f"cmp_f{self.frame_id}_T{tid_b}_ref{i+1}_from_f{fid}.jpg"), crop)
+            
+            if emb_a is None or emb_b is None:
+                print(f"[ReID] Cannot extract current embeddings, skipping")
+                resolved_pairs.append(pair)
+                continue
+            
+            # Gather ref_embeddings (may be empty for one or both)
+            refs_a = track_a.ref_embeddings if hasattr(track_a, 'ref_embeddings') else []
+            refs_b = track_b.ref_embeddings if hasattr(track_b, 'ref_embeddings') else []
+            
+            # Unified voting: each ref set that exists casts an independent vote
+            # vote: +1 = IDs are correct, -1 = IDs are swapped
+            votes = []
+            
+            if len(refs_a) > 0:
+                # refs_a belongs to whoever should be at position A
+                sim_pos_a = max(float(np.dot(emb_a, ref)) for ref in refs_a)
+                sim_pos_b = max(float(np.dot(emb_b, ref)) for ref in refs_a)
+                margin = abs(sim_pos_a - sim_pos_b)
+                vote = +1 if sim_pos_a >= sim_pos_b else -1
+                votes.append((vote, margin))
+                print(f"[ReID] refs_A vote: pos_A_sim={sim_pos_a:.3f}, pos_B_sim={sim_pos_b:.3f} -> {'correct' if vote > 0 else 'swapped'} (margin={margin:.3f})")
+            
+            if len(refs_b) > 0:
+                # refs_b belongs to whoever should be at position B
+                sim_pos_a = max(float(np.dot(emb_a, ref)) for ref in refs_b)
+                sim_pos_b = max(float(np.dot(emb_b, ref)) for ref in refs_b)
+                margin = abs(sim_pos_b - sim_pos_a)
+                vote = +1 if sim_pos_b >= sim_pos_a else -1
+                votes.append((vote, margin))
+                print(f"[ReID] refs_B vote: pos_A_sim={sim_pos_a:.3f}, pos_B_sim={sim_pos_b:.3f} -> {'correct' if vote > 0 else 'swapped'} (margin={margin:.3f})")
+            
+            if len(votes) == 0:
+                print(f"[ReID] No ref_embeddings for either track, cannot decide")
+                resolved_pairs.append(pair)
+                continue
+            
+            # Determine final vote
+            if len(votes) == 1:
+                final_vote = votes[0][0]
+            else:
+                # 2 votes
+                if votes[0][0] == votes[1][0]:
+                    # Both agree
+                    final_vote = votes[0][0]
+                else:
+                    # Conflict: follow the vote with larger margin
+                    final_vote = votes[0][0] if votes[0][1] >= votes[1][1] else votes[1][0]
+                    print(f"[ReID] Vote conflict! margins={votes[0][1]:.3f} vs {votes[1][1]:.3f}, following larger")
+            
+            # Visual feedback
+            self.reid_vis_boxes.append((track_a.tlbr.copy(), tid_a,
+                                        f"T{tid_a} ReID: {'SWAP' if final_vote < 0 else 'OK'}"))
+            self.reid_vis_boxes.append((track_b.tlbr.copy(), tid_b,
+                                        f"T{tid_b} ReID: {'SWAP' if final_vote < 0 else 'OK'}"))
+            
+            if final_vote < 0:
+                # Swap needed
+                print(f"[ReID] SWAP DETECTED! T{tid_a} <-> T{tid_b}")
+                track_a.track_id, track_b.track_id = track_b.track_id, track_a.track_id
+                track_a.ref_embeddings, track_b.ref_embeddings = track_b.ref_embeddings, track_a.ref_embeddings
+                if hasattr(track_a, 'ref_embedding_crops') and hasattr(track_b, 'ref_embedding_crops'):
+                    track_a.ref_embedding_crops, track_b.ref_embedding_crops = track_b.ref_embedding_crops, track_a.ref_embedding_crops
+                print(f"[ReID] Swapped: now T{track_a.track_id} and T{track_b.track_id}")
+            else:
+                print(f"[ReID] IDs are correct")
+            
+            resolved_pairs.append(pair)
+        
+        # Remove resolved pairs
+        for pair in resolved_pairs:
+            self.overlapped_pairs.discard(pair)
+
+    def _capture_ref_embeddings(self, raw_img, output_stracks):
+        """Capture ref embeddings for tracks with pending captures.
+        
+        Called AFTER _record_overlaps and _check_separations.
+        Skips tracks currently in overlapped_pairs (refs captured during
+        overlap are unreliable). Keeps _pending_embedding_capture=True
+        so capture happens after separation.
+        """
+        # Build set of track_ids currently in any overlapped pair
+        overlapped_tids = set()
+        for tid_a, tid_b in self.overlapped_pairs:
+            overlapped_tids.add(tid_a)
+            overlapped_tids.add(tid_b)
+        
+        raw_rgb = _cv2.cvtColor(raw_img, _cv2.COLOR_BGR2RGB)
+        
+        for track in output_stracks:
+            if not (hasattr(track, '_pending_embedding_capture') and track._pending_embedding_capture):
+                continue
+            if len(track.ref_embeddings) >= 3:
+                track._pending_embedding_capture = False
+                continue
+            
+            # Skip if track is in any overlapped pair — keep pending for later
+            if track.track_id in overlapped_tids:
+                continue
+            
+            # Safe to capture
+            track._pending_embedding_capture = False
+            tlbr = track.tlbr
+            emb = self._extract_embedding(raw_rgb, tlbr)
+            if emb is not None:
+                track.ref_embeddings.append(emb)
+                crop = self._crop_image(raw_img, tlbr)
+                if crop is not None:
+                    track.ref_embedding_crops.append((self.frame_id, crop))
+                    if self.reid_debug_dir:
+                        crop_path = os.path.join(self.reid_debug_dir, f"ref_T{track.track_id}_emb{len(track.ref_embeddings)}_f{self.frame_id}.jpg")
+                        _cv2.imwrite(crop_path, crop)
+                print(f"[ReID] T{track.track_id}: captured ref_embedding {len(track.ref_embeddings)}/3 at tracklet_len={track.tracklet_len}")
 
     def enforce_environment_constraints(self, t):
         """

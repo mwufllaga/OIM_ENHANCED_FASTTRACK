@@ -19,12 +19,18 @@ __all__ = [
 def get_model_info(model, tsize):
 
     stride = 64
-    img = torch.zeros((1, 3, stride, stride), device=next(model.parameters()).device)
-    flops, params = profile(deepcopy(model), inputs=(img,), verbose=False)
-    params /= 1e6
-    flops /= 1e9
-    flops *= tsize[0] * tsize[1] / stride / stride * 2  # Gflops
-    info = "Params: {:.2f}M, Gflops: {:.2f}".format(params, flops)
+    device = next(model.parameters()).device
+    try:
+        model_copy = deepcopy(model).to("cpu")
+        img = torch.zeros((1, 3, stride, stride), device="cpu")
+        flops, params = profile(model_copy, inputs=(img,), verbose=False)
+        params /= 1e6
+        flops /= 1e9
+        flops *= tsize[0] * tsize[1] / stride / stride * 2  # Gflops
+        info = "Params: {:.2f}M, Gflops: {:.2f}".format(params, flops)
+    except Exception as e:
+        params = sum(p.numel() for p in model.parameters()) / 1e6
+        info = "Params: {:.2f}M, Gflops: N/A (profile failed: {})".format(params, e)
     return info
 
 

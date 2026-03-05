@@ -5,6 +5,7 @@ import time
 import cv2
 import torch
 import json
+import sys
 from loguru import logger
 
 from yolox.data.data_augment import preproc
@@ -230,6 +231,9 @@ def image_demo(predictor, vis_folder, current_time, args):
     files.sort()
     if args.occ:
         config = load_or_init_config(args)
+        # Add reid_debug_dir if saving results
+        if args.save_result and vis_folder:
+            config["reid_debug_dir"] = osp.join(vis_folder, "reid_crops")
         tracker = Fasttracker(args, config, frame_rate=args.fps)
     else:
         tracker = BYTETracker(args, frame_rate=args.fps)
@@ -239,7 +243,7 @@ def image_demo(predictor, vis_folder, current_time, args):
     for frame_id, img_path in enumerate(files, 1):
         outputs, img_info = predictor.inference(img_path, timer)
         if outputs[0] is not None:
-            online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+            online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size, raw_img=img_info['raw_img'])
             online_tlwhs = []
             online_ids = []
             online_scores = []
@@ -303,6 +307,9 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
 
     if args.occ:
         config = load_or_init_config(args)
+        # Add reid_debug_dir to save ReID crops for debugging
+        if args.save_result:
+            config["reid_debug_dir"] = osp.join(save_folder, "reid_crops")
         tracker = Fasttracker(args, config, frame_rate=30)
     else:
         tracker = BYTETracker(args, frame_rate=30)
@@ -316,7 +323,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         if ret_val:
             outputs, img_info = predictor.inference(frame, timer)
             if outputs[0] is not None:
-                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size, raw_img=img_info['raw_img'])
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
@@ -341,6 +348,19 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             else:
                 timer.toc()
                 online_im = img_info['raw_img']
+
+            # --- ReID visual feedback: red boxes + "ReID Triggered" ---
+            reid_boxes = getattr(tracker, 'reid_vis_boxes', [])
+            if reid_boxes:
+                # Draw "ReID Triggered" banner at top
+                cv2.putText(online_im, 'ReID Triggered', (20, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 255), 4, cv2.LINE_AA)
+                for (tlbr, tid, label) in reid_boxes:
+                    x1, y1, x2, y2 = int(tlbr[0]), int(tlbr[1]), int(tlbr[2]), int(tlbr[3])
+                    cv2.rectangle(online_im, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                    cv2.putText(online_im, label, (x1, max(y1 - 10, 0)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+
             cv2.imshow('Tracking', online_im)
             if args.save_result:
                 vid_writer.write(online_im)
@@ -368,10 +388,42 @@ def main(exp, args):
     if args.save_result:
         vis_folder = osp.join(output_dir, "track_vis")
         os.makedirs(vis_folder, exist_ok=True)
+        
+        # Setup logging to file (capture all print and logger output)
+        current_time = time.localtime()
+        timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+        console_log_file = osp.join(vis_folder, f"{timestamp}_console.log")
+        
+        # Tee stdout to both console and file
+        class TeeOutput:
+            def __init__(self, filename):
+                self.terminal = sys.stdout
+                self.log = open(filename, 'w')
+            def write(self, message):
+                self.terminal.write(message)
+                self.log.write(message)
+                self.log.flush()
+            def flush(self):
+                self.terminal.flush()
+                self.log.flush()
+        sys.stdout = TeeOutput(console_log_file)
+        logger.info(f"Console log will be saved to: {console_log_file}")
 
     if args.trt:
         args.device = "gpu"
-    args.device = torch.device("cuda" if args.device == "gpu" else "cpu")
+    if args.device == "gpu":
+        if torch.cuda.is_available():
+            args.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            args.device = torch.device("mps")
+            logger.info("CUDA not available, using MPS (Apple Silicon GPU)")
+            args.fp16 = False  # MPS does not fully support fp16
+        else:
+            args.device = torch.device("cpu")
+            logger.info("CUDA not available, using CPU")
+            args.fp16 = False
+    else:
+        args.device = torch.device(args.device)
 
     logger.info("Args: {}".format(args))
 
